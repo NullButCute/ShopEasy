@@ -22,6 +22,7 @@ public class SagaTimeoutService(
     private readonly TimeSpan _checkInterval = TimeSpan.FromSeconds(30);
     private readonly TimeSpan _sagaTimeout = TimeSpan.FromMinutes(2);
     private const int MaxReleaseAttempts = 3;
+    private const int PaidCancellationAttemptsBeforeAlarm = 5;
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
@@ -211,6 +212,31 @@ public class SagaTimeoutService(
                     await CancelOrder(saga, db,
                         "Timed out during inventory release compensation", CancelReason.ReleaseNotConfirmed);
                 }
+                break;
+
+            case SagaStatus.RefundingPayment:
+            case SagaStatus.RestockingInventory:
+                // A paid order is being cancelled and a command or its answer got lost. Refund and
+                // restock are idempotent and answer again, so send the command again. Money is
+                // involved, so never give up on it or cancel the order on a guess: after a few attempts
+                // keep trying, at the same pace, and log it as critical for a person.
+                if (saga.RetryCount >= PaidCancellationAttemptsBeforeAlarm)
+                    logger.LogCritical(
+                        "Saga {SagaId}: {Status} for Order {OrderId} was not answered after {Attempts} attempts — " +
+                        "MANUAL INTERVENTION REQUIRED (the customer's money or the stock is in between).",
+                        saga.Id, saga.Status, saga.OrderId, saga.RetryCount);
+
+                if (saga.Status == SagaStatus.RefundingPayment)
+                    await publishEndpoint.Publish(new RefundPaymentCommand
+                    {
+                        OrderId = saga.OrderId,
+                        Reason = saga.FailureReason ?? "Cancelled"
+                    }, ct);
+                else
+                    await publishEndpoint.Publish(new RestockInventoryCommand { OrderId = saga.OrderId }, ct);
+
+                saga.RetryCount++;
+                saga.UpdatedAt = DateTime.UtcNow;
                 break;
 
             case SagaStatus.Completing:

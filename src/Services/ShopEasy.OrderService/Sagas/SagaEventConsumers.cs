@@ -294,6 +294,7 @@ public class InventoryCommittedConsumer(
         if (FailureReasons.IsCancelRequest(saga.FailureReason))
         {
             saga.Status = SagaStatus.RefundingPayment;
+            saga.RetryCount = 0;
             saga.UpdatedAt = DateTime.UtcNow;
             await db.SaveChangesAsync();
             await readModelUpdater.UpdateStatusAsync(

@@ -221,13 +221,13 @@ public class CancellationTests : IDisposable
     [InlineData(true, "Cancelled by admin")]
     public async Task AConfirmedOrder_IsCancelledByRefundingTheMoneyFirst(bool admin, string reason)
     {
-        var orderId = await Seed(SagaStatus.Completed, OrderStatus.Confirmed);
+        var orderId = await Seed(SagaStatus.Completed, OrderStatus.Confirmed, retryCount: 9);
 
         var result = await _service.CancelAsync(orderId, admin ? "an-admin" : Owner, isAdmin: admin);
 
         result.Outcome.Should().Be(CancelOutcome.Cancelling);
         var saga = await SagaOf(orderId);
-        (saga.Status, saga.FailureReason).Should().Be((SagaStatus.RefundingPayment, reason));
+        (saga.Status, saga.FailureReason, saga.RetryCount).Should().Be((SagaStatus.RefundingPayment, reason, 0));
         (await OrderOf(orderId)).Status.Should().Be(OrderStatus.Confirmed, "it is only Cancelled once the money and the stock are back");
         var summary = await SummaryOf(orderId);
         (summary.PaymentStatus, summary.FailureReason).Should().Be(("Refunding", reason));

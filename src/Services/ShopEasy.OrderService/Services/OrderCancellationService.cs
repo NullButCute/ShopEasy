@@ -140,6 +140,7 @@ public class OrderCancellationService(
                 // and InventoryRestockedConsumer take the next steps); the order is Cancelled at the end
                 saga.Status = SagaStatus.RefundingPayment;
                 saga.FailureReason = reason;
+                saga.RetryCount = 0; // each step of a paid cancellation counts its own attempts
                 saga.UpdatedAt = now;
                 await db.SaveChangesAsync(ct);
 

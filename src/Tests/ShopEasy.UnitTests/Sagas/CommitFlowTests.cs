@@ -36,7 +36,7 @@ public class CommitFlowTests : IDisposable
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    private async Task<Guid> Seed(SagaStatus status, string? failureReason = null)
+    private async Task<Guid> Seed(SagaStatus status, string? failureReason = null, int retryCount = 0)
     {
         var orderId = Guid.NewGuid();
         var now = DateTime.UtcNow;
@@ -57,7 +57,7 @@ public class CommitFlowTests : IDisposable
         {
             Id = Guid.NewGuid(), OrderId = orderId, Status = status,
             UserId = "user-1", UserEmail = "u@test.com", TotalAmount = 50m,
-            ItemsJson = "[]", FailureReason = failureReason, CreatedAt = now, UpdatedAt = now
+            ItemsJson = "[]", FailureReason = failureReason, RetryCount = retryCount, CreatedAt = now, UpdatedAt = now
         });
         await _db.SaveChangesAsync();
         return orderId;
@@ -104,12 +104,13 @@ public class CommitFlowTests : IDisposable
     [InlineData("Cancelled by admin")]
     public async Task InventoryCommitted_ForAnOrderCancelledMeanwhile_RefundsInsteadOfCompleting(string reason)
     {
-        var orderId = await Seed(SagaStatus.Completing, failureReason: reason);
+        var orderId = await Seed(SagaStatus.Completing, failureReason: reason, retryCount: 7);
         var context = Ctx(new InventoryCommittedEvent { OrderId = orderId });
 
         await Committed().Consume(context);
 
-        (await SagaOf(orderId)).Status.Should().Be(SagaStatus.RefundingPayment);
+        var saga = await SagaOf(orderId);
+        (saga.Status, saga.RetryCount).Should().Be((SagaStatus.RefundingPayment, 0), "the refund counts its own attempts");
         (await OrderOf(orderId)).Status.Should().Be(OrderStatus.Pending, "it was never confirmed");
         (await SummaryOf(orderId)).PaymentStatus.Should().Be("Refunding");
         await context.Received(1).Publish(

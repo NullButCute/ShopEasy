@@ -24,7 +24,7 @@ public class PaidCancellationTests : IDisposable
 
     public void Dispose() => _db.Dispose();
 
-    private async Task<Guid> Seed(SagaStatus saga, OrderStatus order = OrderStatus.Confirmed)
+    private async Task<Guid> Seed(SagaStatus saga, OrderStatus order = OrderStatus.Confirmed, int retryCount = 0)
     {
         var id = Guid.NewGuid();
         var now = DateTime.UtcNow;
@@ -37,7 +37,7 @@ public class PaidCancellationTests : IDisposable
         _db.SagaStates.Add(new OrderSagaState
         {
             Id = Guid.NewGuid(), OrderId = id, Status = saga, UserId = "u", UserEmail = "u@test.com", TotalAmount = 20m,
-            ItemsJson = "[]", FailureReason = "Cancelled by customer", CreatedAt = now, UpdatedAt = now
+            ItemsJson = "[]", FailureReason = "Cancelled by customer", RetryCount = retryCount, CreatedAt = now, UpdatedAt = now
         });
         await _db.SaveChangesAsync();
         return id;
@@ -56,11 +56,12 @@ public class PaidCancellationTests : IDisposable
     [Fact]
     public async Task ARefundedPayment_MovesTheSagaOn_AndAsksInventoryToPutTheStockBack()
     {
-        var orderId = await Seed(SagaStatus.RefundingPayment);
+        var orderId = await Seed(SagaStatus.RefundingPayment, retryCount: 4);
 
         await PaymentRefunded(orderId);
 
-        (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).Status.Should().Be(SagaStatus.RestockingInventory);
+        var saga = await _db.SagaStates.SingleAsync(s => s.OrderId == orderId);
+        (saga.Status, saga.RetryCount).Should().Be((SagaStatus.RestockingInventory, 0));
         (await _db.OrderSummaries.SingleAsync(s => s.OrderId == orderId)).PaymentStatus.Should().Be("Refunded");
         await _publish.Received(1).Publish(
             Arg.Is<RestockInventoryCommand>(c => c.OrderId == orderId), Arg.Any<CancellationToken>());

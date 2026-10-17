@@ -41,6 +41,7 @@ public class PaymentRefundedConsumer(
                 saga.Id, saga.OrderId);
 
             saga.Status = SagaStatus.RestockingInventory;
+            saga.RetryCount = 0;
             saga.UpdatedAt = DateTime.UtcNow;
             await db.SaveChangesAsync();
 

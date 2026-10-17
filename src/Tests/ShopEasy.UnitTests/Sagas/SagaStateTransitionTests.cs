@@ -294,6 +294,52 @@ public class SagaStateTransitionTests : IDisposable
     }
 
     [Fact]
+    public async Task Timeout_ALostRefund_IsAskedForAgain_WithTheReasonOfTheCancellation()
+    {
+        var orderId = await Seed(SagaStatus.RefundingPayment, updatedAt: LongAgo);
+        (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).FailureReason = "Cancelled by customer";
+        await _db.SaveChangesAsync();
+
+        await RunTimeoutCheck();
+
+        var saga = await SagaOf(orderId);
+        (saga.Status, saga.RetryCount).Should().Be((SagaStatus.RefundingPayment, 1));
+        saga.UpdatedAt.Should().BeAfter(LongAgo);
+        await _publish.Received(1).Publish(
+            Arg.Is<RefundPaymentCommand>(c => c.OrderId == orderId && c.Reason == "Cancelled by customer"), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Timeout_LostStockRestock_IsAskedForAgain()
+    {
+        var orderId = await Seed(SagaStatus.RestockingInventory, updatedAt: LongAgo);
+
+        await RunTimeoutCheck();
+
+        (await SagaOf(orderId)).RetryCount.Should().Be(1);
+        await _publish.Received(1).Publish(
+            Arg.Is<RestockInventoryCommand>(c => c.OrderId == orderId), Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(SagaStatus.RefundingPayment)]
+    [InlineData(SagaStatus.RestockingInventory)]
+    public async Task Timeout_APaidCancellationThatNeverAnswers_KeepsTryingAndIsNeverCancelledOnAGuess(SagaStatus status)
+    {
+        var orderId = await Seed(status, updatedAt: LongAgo, retryCount: 12);
+
+        await RunTimeoutCheck();
+
+        var saga = await SagaOf(orderId);
+        (saga.Status, saga.RetryCount).Should().Be((status, 13));
+        (await OrderOf(orderId)).Status.Should().NotBe(OrderStatus.Cancelled);
+        if (status == SagaStatus.RefundingPayment)
+            await _publish.Received(1).Publish(Arg.Any<RefundPaymentCommand>(), Arg.Any<CancellationToken>());
+        else
+            await _publish.Received(1).Publish(Arg.Any<RestockInventoryCommand>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task Timeout_AStuckCommit_KeepsTheCancellationThatWasAskedFor()
     {
         var orderId = await Seed(SagaStatus.Completing, updatedAt: LongAgo, retryCount: 10);
