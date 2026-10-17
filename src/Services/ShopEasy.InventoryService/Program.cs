@@ -97,6 +97,7 @@ try
         x.AddConsumer<ReserveInventoryConsumer>();
         x.AddConsumer<ReleaseInventoryConsumer>();
         x.AddConsumer<CommitInventoryConsumer>();
+        x.AddConsumer<RestockInventoryConsumer>();
 
         // ── Transactional inbox/outbox ────────────────────────────────────────
         // Each consumer endpoint below runs inside ONE database transaction holding the stock
@@ -172,6 +173,19 @@ try
                 });
                 e.UseEntityFrameworkOutbox<InventoryDbContext>(ctx);
                 e.ConfigureConsumer<CommitInventoryConsumer>(ctx);
+            });
+
+            cfg.ReceiveEndpoint("inventory-restock", e =>
+            {
+                e.ConfigureConsumeTopology = false;
+                e.ConcurrentMessageLimit = 1;
+                e.Bind("ShopEasy.Shared.Contracts:RestockInventoryCommand", b =>
+                {
+                    b.ExchangeType = "fanout";
+                    b.Durable = true;
+                });
+                e.UseEntityFrameworkOutbox<InventoryDbContext>(ctx);
+                e.ConfigureConsumer<RestockInventoryConsumer>(ctx);
             });
         });
     });

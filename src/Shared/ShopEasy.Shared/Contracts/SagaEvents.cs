@@ -25,6 +25,13 @@ public record InventoryCommittedEvent
     public Guid OrderId { get; init; }
 }
 
+// InventoryService → Saga: the stock of a cancelled, paid order is back in the shelf counts.
+// Also sent again when the command is repeated.
+public record InventoryRestockedEvent
+{
+    public Guid OrderId { get; init; }
+}
+
 // InventoryService → Saga: the reservation can never be committed
 // (it does not exist or was already released). Payment has been taken, so the saga
 // must refund and cancel. Transient errors are NOT reported this way — they are retried.

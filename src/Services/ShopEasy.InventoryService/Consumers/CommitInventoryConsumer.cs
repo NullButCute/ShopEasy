@@ -12,6 +12,7 @@ namespace ShopEasy.InventoryService.Consumers;
 // Idempotent: the order's ledger rows (checked under the row locks) decide what to do, so a
 // duplicate or retried command never deducts stock twice — it just re-sends the result.
 //   already committed            → success again, no change
+//   stock put back (cancelled)   → InventoryCommitFailedEvent
 //   reservation was released     → InventoryCommitFailedEvent (the saga refunds the payment)
 //   no reservation at all        → InventoryCommitFailedEvent
 // Transient errors (database down, ...) throw, so MassTransit retries the message.
@@ -55,7 +56,11 @@ public class CommitInventoryConsumer(
                     .ToListAsync(ct);
                 var state = OrderStockState.From(orderId, rows);
 
-                if (state.FullyCommitted)
+                if (state.AnyRestocked)
+                {
+                    failureReason = "The order was cancelled and its stock put back";
+                }
+                else if (state.FullyCommitted)
                 {
                     logger.LogWarning(
                         "Order {OrderId} was already committed — re-confirming", orderId);

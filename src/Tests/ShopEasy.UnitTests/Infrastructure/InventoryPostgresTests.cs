@@ -59,6 +59,18 @@ public class InventoryPostgresTests
         ]
     };
 
+    // Runs one consumer on a context of its own, as the bus does for each message
+    private static async Task Consume<TMessage>(
+        DbContextOptions<InventoryDbContext> options, TMessage message,
+        Func<InventoryDbContext, IConsumer<TMessage>> create) where TMessage : class
+    {
+        await using var db = new InventoryDbContext(options);
+        var context = Substitute.For<ConsumeContext<TMessage>>();
+        context.Message.Returns(message);
+        context.CancellationToken.Returns(CancellationToken.None);
+        await create(db).Consume(context);
+    }
+
     // ── Row locking ───────────────────────────────────────────────────────────
 
     [RequiresPostgresFact]
@@ -95,6 +107,33 @@ public class InventoryPostgresTests
         item.ReservedQty.Should().Be(9);
         item.AvailableQuantity.Should().Be(1);
         (await check.StockTransactions.CountAsync()).Should().Be(3);
+    }
+
+    [RequiresPostgresFact]
+    public async Task AReservedCommittedAndRestockedOrder_EndsWithTheUnitsBack_AndRestocksOnce()
+    {
+        await using var database = await PostgresTestDatabase.CreateAsync("restock");
+        var options = await CreateInventoryAsync(database, quantity: 10);
+        var orderId = Guid.NewGuid();
+        var locking = new PostgresInventoryLocking();
+        var restock = new RestockInventoryCommand { OrderId = orderId };
+
+        await Consume(options, Reserve(orderId, 3), db =>
+            new ReserveInventoryConsumer(db, locking, NewCache(), NullLogger<ReserveInventoryConsumer>.Instance));
+        await Consume(options, new CommitInventoryCommand { OrderId = orderId }, db =>
+            new CommitInventoryConsumer(db, locking, NewCache(), NullLogger<CommitInventoryConsumer>.Instance));
+        await using (var mid = new InventoryDbContext(options))
+            (await mid.InventoryItems.SingleAsync()).Quantity.Should().Be(7);
+
+        for (var i = 0; i < 2; i++) // the second command is a repeat
+            await Consume(options, restock, db =>
+                new RestockInventoryConsumer(db, locking, NewCache(), NullLogger<RestockInventoryConsumer>.Instance));
+
+        await using var check = new InventoryDbContext(options);
+        var item = await check.InventoryItems.SingleAsync();
+        item.Quantity.Should().Be(10);
+        item.ReservedQty.Should().Be(0);
+        (await check.StockTransactions.CountAsync(t => t.Reason == StockReasons.Restocked(orderId))).Should().Be(1);
     }
 
     [RequiresPostgresFact]

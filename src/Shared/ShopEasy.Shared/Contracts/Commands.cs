@@ -19,6 +19,12 @@ public record ReleaseInventoryCommand
     public Guid OrderId { get; init; }
 }
 
+// Saga → InventoryService: put the stock of a committed order back (the paid order was cancelled)
+public record RestockInventoryCommand
+{
+    public Guid OrderId { get; init; }
+}
+
 // Saga → PaymentService: process payment
 public record ProcessPaymentCommand
 {
