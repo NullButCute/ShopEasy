@@ -99,6 +99,33 @@ public class CommitFlowTests : IDisposable
         summary.PaymentStatus.Should().Be("Succeeded");
     }
 
+    [Theory]
+    [InlineData("Cancelled by customer")]
+    [InlineData("Cancelled by admin")]
+    public async Task InventoryCommitted_ForAnOrderCancelledMeanwhile_RefundsInsteadOfCompleting(string reason)
+    {
+        var orderId = await Seed(SagaStatus.Completing, failureReason: reason);
+        var context = Ctx(new InventoryCommittedEvent { OrderId = orderId });
+
+        await Committed().Consume(context);
+
+        (await SagaOf(orderId)).Status.Should().Be(SagaStatus.RefundingPayment);
+        (await OrderOf(orderId)).Status.Should().Be(OrderStatus.Pending, "it was never confirmed");
+        (await SummaryOf(orderId)).PaymentStatus.Should().Be("Refunding");
+        await context.Received(1).Publish(
+            Arg.Is<RefundPaymentCommand>(c => c.OrderId == orderId && c.Reason == reason), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task InventoryCommitted_WithAFailureReasonThatIsNotACancellation_StillCompletes()
+    {
+        var orderId = await Seed(SagaStatus.Completing, failureReason: "CommitInventory stuck after 10 retries");
+
+        await Committed().Consume(Ctx(new InventoryCommittedEvent { OrderId = orderId }));
+
+        (await SagaOf(orderId)).Status.Should().Be(SagaStatus.Completed);
+    }
+
     [Fact]
     public async Task InventoryCommitted_WhenAlreadyCompleted_IsIgnored()
     {

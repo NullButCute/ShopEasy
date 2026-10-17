@@ -305,9 +305,10 @@ public class SagaPostgresTests
 
             if (outbox.Count<CommitInventoryCommand>() > 0)
             {
-                // payment first: the order is being completed, so the cancel is too late
+                // payment first: the cancel is kept until the stock commit lands, then refunded
                 saga.Status.Should().Be(SagaStatus.Completing, $"round {round}");
-                cancelResult!.Outcome.Should().Be(CancelOutcome.NotCancellable, $"round {round}");
+                saga.FailureReason.Should().Be("Cancelled by customer", $"round {round}");
+                cancelResult!.Outcome.Should().Be(CancelOutcome.Cancelling, $"round {round}");
                 outbox.Count<ReleaseInventoryCommand>().Should().Be(0, $"round {round}");
                 outbox.Count<RefundPaymentCommand>().Should().Be(0, $"round {round}");
             }

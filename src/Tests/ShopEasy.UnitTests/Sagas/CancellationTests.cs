@@ -186,11 +186,24 @@ public class CancellationTests : IDisposable
         await AssertNothingPublished();
     }
 
+    [Fact]
+    public async Task WhileTheStockCommitIsInFlight_TheRequestIsKept_AndNothingIsSentYet()
+    {
+        var orderId = await Seed(SagaStatus.Completing, OrderStatus.Pending);
+
+        var result = await _service.CancelAsync(orderId, Owner, isAdmin: false);
+
+        result.Outcome.Should().Be(CancelOutcome.Cancelling);
+        var saga = await SagaOf(orderId);
+        (saga.Status, saga.FailureReason).Should().Be((SagaStatus.Completing, "Cancelled by customer"));
+        (await OrderOf(orderId)).Status.Should().Be(OrderStatus.Pending);
+        await AssertNothingPublished();
+    }
+
     [Theory]
-    [InlineData(SagaStatus.Completing, OrderStatus.Pending)]
     [InlineData(SagaStatus.Completed, OrderStatus.Shipped)]
     [InlineData(SagaStatus.Completed, OrderStatus.Delivered)]
-    public async Task WhileThePaymentIsBeingFinalized_OrAfterShipping_TheOrderCanNoLongerBeCancelled(SagaStatus saga, OrderStatus order)
+    public async Task AfterShipping_TheOrderCanNoLongerBeCancelled(SagaStatus saga, OrderStatus order)
     {
         var orderId = await Seed(saga, order);
 

@@ -293,6 +293,18 @@ public class SagaStateTransitionTests : IDisposable
         await _publish.DidNotReceive().Publish(Arg.Any<CommitInventoryCommand>(), Arg.Any<CancellationToken>());
     }
 
+    [Fact]
+    public async Task Timeout_AStuckCommit_KeepsTheCancellationThatWasAskedFor()
+    {
+        var orderId = await Seed(SagaStatus.Completing, updatedAt: LongAgo, retryCount: 10);
+        (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).FailureReason = "Cancelled by customer";
+        await _db.SaveChangesAsync();
+
+        await RunTimeoutCheck();
+
+        (await SagaOf(orderId)).FailureReason.Should().Be("Cancelled by customer");
+    }
+
     [Theory]
     [InlineData(SagaStatus.Completed)]
     [InlineData(SagaStatus.Cancelled)]

@@ -15,7 +15,7 @@ public enum CancelOutcome
     Cancelling,         // accepted: the saga is releasing stock / the payment will be refunded
     AlreadyCancelled,   // nothing to do — repeating a cancel is safe
     NotFound,           // no such order (or it belongs to someone else)
-    NotCancellable      // too late: the order has shipped, or its payment is being finalized
+    NotCancellable      // too late: the order has shipped
 }
 
 public record CancelResult(CancelOutcome Outcome, string? Message = null);
@@ -36,7 +36,8 @@ public record CancelResult(CancelOutcome Outcome, string? Message = null);
 //   Completed (paid, committed)           → saga moves to RefundingPayment and a RefundPaymentCommand
 //                                           is sent; the refund, then the restock, then Cancelled → Cancelling
 //   RefundingPayment / RestockingInventory→ that cancellation is already running                → Cancelling
-//   Completing                            → payment taken, commit in flight: too late for now   → NotCancellable
+//   Completing                            → payment taken, commit in flight: the request is kept in
+//                                           FailureReason; InventoryCommittedConsumer then refunds → Cancelling
 //   a shipped or delivered order          → NotCancellable
 public class OrderCancellationService(
     OrderDbContext db,
@@ -153,9 +154,20 @@ public class OrderCancellationService(
                     new RefundPaymentCommand { OrderId = order.Id, Reason = reason });
 
             case SagaStatus.Completing:
-                return (NotCancellable(
-                    "Payment was already taken and the order is being finalized; " +
-                    "it can no longer be cancelled."), null);
+                // Payment taken, stock commit in flight. Keep the request; when Inventory confirms the
+                // commit, InventoryCommittedConsumer refunds instead of completing (a failed commit
+                // already refunds and cancels). UpdatedAt stays, so the timeout keeps its own clock.
+                saga.FailureReason = reason;
+                await db.SaveChangesAsync(ct);
+                await readModelUpdater.UpdateStatusAsync(
+                    order.Id, order.Status, failureReason: reason);
+                await transaction.CommitAsync(ct);
+
+                logger.LogInformation(
+                    "Order {OrderId} cancellation accepted while its stock commit is in flight ({Reason})",
+                    orderId, reason);
+                return (new CancelResult(CancelOutcome.Cancelling,
+                    "Cancellation accepted. The order is being finalized and will then be refunded."), null);
 
             case SagaStatus.Cancelled:
             case SagaStatus.Failed:

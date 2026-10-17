@@ -220,8 +220,8 @@ public class SagaTimeoutService(
                         "Saga {SagaId}: CommitInventory stuck after {Retry} retries. " +
                         "MANUAL INTERVENTION REQUIRED for Order {OrderId}",
                         saga.Id, saga.RetryCount, saga.OrderId);
-                    saga.FailureReason =
-                        $"CommitInventory stuck after {saga.RetryCount} retries";
+                    if (!FailureReasons.IsCancelRequest(saga.FailureReason)) // keep a cancellation asked for
+                        saga.FailureReason = $"CommitInventory stuck after {saga.RetryCount} retries";
                     saga.UpdatedAt = DateTime.UtcNow;
                 }
                 else

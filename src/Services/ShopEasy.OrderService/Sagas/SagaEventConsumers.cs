@@ -288,6 +288,27 @@ public class InventoryCommittedConsumer(
             return;
         }
 
+        // Cancelled while the commit was in flight (OrderCancellationService left the request in
+        // FailureReason): the stock is committed and the money taken, so the order is not completed.
+        // Refund it; the saga then puts the stock back and cancels it.
+        if (FailureReasons.IsCancelRequest(saga.FailureReason))
+        {
+            saga.Status = SagaStatus.RefundingPayment;
+            saga.UpdatedAt = DateTime.UtcNow;
+            await db.SaveChangesAsync();
+            await readModelUpdater.UpdateStatusAsync(
+                saga.OrderId, OrderStatus.Pending, paymentStatus: "Refunding");
+            await transaction.CommitAsync();
+
+            logger.LogInformation(
+                "Saga {SagaId}: commit done for Order {OrderId}, which was cancelled meanwhile — refunding",
+                saga.Id, saga.OrderId);
+            await context.Publish(
+                new RefundPaymentCommand { OrderId = saga.OrderId, Reason = saga.FailureReason! },
+                context.CancellationToken);
+            return;
+        }
+
         var order = await db.Orders.FindAsync(saga.OrderId);
         if (order is not null)
         {
