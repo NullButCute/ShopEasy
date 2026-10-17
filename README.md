@@ -180,6 +180,11 @@ stateDiagram-v2
     Started --> Cancelled: customer cancel
     Completing --> Failed: InventoryCommitFailed (payment refunded)
 
+    Completed --> RefundingPayment: cancel of a paid order
+    Completing --> RefundingPayment: cancel asked while committing, once InventoryCommitted
+    RefundingPayment --> RestockingInventory: PaymentRefunded
+    RestockingInventory --> Cancelled: InventoryRestocked
+
     Completed --> [*]
     Cancelled --> [*]
     Failed --> [*]
@@ -328,7 +333,8 @@ OrderConfirmed → ReserveInventory → ProcessPayment → CommitInventory → I
 ```
 
 **Saga states:** `Started → ReservingInventory → ProcessingPayment → Completing → Completed`
-(or the compensation branch: `→ ReleasingInventory → Cancelled/Failed`)
+(or the compensation branch: `→ ReleasingInventory → Cancelled/Failed`;
+or, for a paid order that is cancelled: `→ RefundingPayment → RestockingInventory → Cancelled`)
 
 The saga only becomes `Completed` (and the order `Confirmed`) when the Inventory service has **confirmed the stock commit** with an `InventoryCommittedEvent`. While it waits it is in `Completing`; if no answer arrives the timeout service re-sends the commit (safe, because commit is idempotent).
 
@@ -347,7 +353,10 @@ Each handler only acts when the saga is in the state its event is valid for. A d
 | Duplicate "payment succeeded" event | unchanged | charged | Ignored — never refunds an order that is completing or completed |
 | Customer cancels before payment | reserved or nothing | not charged | Release inventory → Cancelled (see [Cancelling an order](#cancelling-an-order)) |
 | Customer cancels while payment is in flight | reserved | may still be charged | Release inventory; a payment that succeeds is **refunded** → Cancelled |
-| Customer cancels after payment | committed or committing | charged | Rejected with `409` (no returns flow yet) |
+| Customer cancels a completed (paid) order | committed | charged | **Refund** → **restock** → Cancelled (`RefundingPayment`, `RestockingInventory`) |
+| Customer cancels while the stock commit is in flight | committing | charged | The request is kept; when the commit lands the order is refunded, restocked and Cancelled, never shown as Confirmed |
+| A refund or restock command (or its answer) is lost | committed | charged or refunded | Re-sent by the timeout service every two minutes; never given up on or cancelled on a guess, logged as critical after five tries |
+| Customer cancels a shipped order | shipped | charged | Rejected with `409` (there is no shipping or return flow yet) |
 
 ### 5. Outbox Pattern
 
@@ -442,7 +451,7 @@ Every service exposes `/health`, `/health/ready`, and `/health/live`. Used by Do
 - **Correlation across messages** — the id does not stop at the first RabbitMQ message. The gateway generates one when the client sends none (and returns it in the `X-Correlation-Id` response header), passes it to the service behind it, and from there it follows the order: it is stored on the order's outbox entry and saga, stamped as a header on every command and event, and restored in each consumer — also across the Payment/Inventory outboxes and the background workers (outbox delivery, orchestrator, timeout service), which have no HTTP request of their own. Every consumer also logs the message's `OrderId`. See [Following one order across services](#following-one-order-across-services).
 - **Traces** — OpenTelemetry exports spans to Jaeger: HTTP requests and calls, **one span per RabbitMQ message** sent or consumed (MassTransit; linked across services), and **one span per database command** (Npgsql, with the SQL in the `db.statement` tag), so a request fans out across services, queues and databases on one timeline.
 - **Metrics** — custom Prometheus counters (`orders_placed_total`, `outbox_pending_messages`, `sagas_active`, `saga_duration_seconds`, `inventory_cache_hits_total`) visualized in Grafana. The **ShopEasy Overview** dashboard has panels for order outcomes, orders refused at the door, payments, confirmed sales and the age of the oldest active order.
-  - **Orders:** `shopeasy_orders_placed_total{status="accepted"}` counts orders accepted at the door. `shopeasy_order_outcomes_total{outcome,reason}` counts how they ended: `confirmed`; `cancelled`, with the reason (`stock_unavailable`, `payment_declined`, `customer`, `admin`, `timeout`, `release_not_confirmed`, `inventory_commit_failed`); or `failed`, when the orchestrator gave up on an order and a person has to look at it. `shopeasy_orders_rejected_total{reason}` counts the requests refused before anything was saved (`invalid_request`, `unknown_product`, `catalog_unavailable`, `insufficient_stock`, `inventory_unreachable`). `shopeasy_orders_confirmed_amount_total` adds up the amounts of the confirmed orders in the shop's currency.
+  - **Orders:** `shopeasy_orders_placed_total{status="accepted"}` counts orders accepted at the door. `shopeasy_order_outcomes_total{outcome,reason}` counts how they ended: `confirmed`; `cancelled`, with the reason (`stock_unavailable`, `payment_declined`, `customer`, `admin`, `timeout`, `release_not_confirmed`, `inventory_commit_failed`); or `failed`, when the orchestrator gave up on an order and a person has to look at it. `shopeasy_orders_rejected_total{reason}` counts the requests refused before anything was saved (`invalid_request`, `unknown_product`, `catalog_unavailable`, `insufficient_stock`, `inventory_unreachable`). `shopeasy_orders_confirmed_amount_total` adds up the amounts of the confirmed orders in the shop's currency. An order cancelled after payment was counted as `confirmed` when it was completed and is counted as `cancelled` too (its refund shows in `shopeasy_payments_total{result="refunded"}`); the confirmed counters are not corrected.
   - **Payments:** `shopeasy_payments_total{result}` and `shopeasy_payments_amount_total{result}` count what the payment provider answered (`succeeded`, `declined`) and what was given back (`refunded`), with the amounts. A command delivered twice is counted once.
   - **Stuck orders:** `shopeasy_sagas_active` is the number of orders still being processed and `shopeasy_saga_oldest_active_age_seconds` the age of the oldest of them (0 when there is none). The timeout service reads both from the database every 30 seconds, so every Order instance reports the same value (use `max()` across instances). An age that keeps rising means an order is stuck.
   - **Alert rules:** `prometheus-rules.yml` raises `OrderStuck`, `OrderFailed`, `StockMayHaveLeaked`, `OutboxBacklog` and `PaymentsDeclinedHigh`; firing alerts are listed at http://localhost:9090/alerts. Sending them anywhere needs an Alertmanager, which is not part of this stack. `prometheus-rules.test.yml` checks each rule against made-up series (`promtool test rules prometheus-rules.test.yml`), and CI runs it.
@@ -923,9 +932,12 @@ Replays are counted in the `shopeasy_orders_idempotent_replays_total{result}` me
 | `ReservingInventory` or `ProcessingPayment` | Saga moves to `ReleasingInventory` and sends `ReleaseInventoryCommand`. A payment that still succeeds is refunded (late-payment guard), a reservation that arrives late is released again. When Inventory confirms the release the order becomes `Cancelled` | `202 Accepted` `{ "status": "Cancelling", ... }`; poll `GET /api/orders/{id}` until `Cancelled` |
 | `ReleasingInventory` (already being cancelled, e.g. after a payment failure) | Nothing new to do | `202 Accepted` |
 | Already `Cancelled` / `Failed` | Nothing to do (repeating a cancel is safe) | `204 No Content` |
-| `Completing` or `Completed` (payment taken, order confirmed or being finalized) | Not cancellable: there is no return/refund flow after completion | `409 Conflict` `{ "message": "..." }` |
+| `Completed` (paid, committed, order `Confirmed`) | Saga moves to `RefundingPayment` and sends `RefundPaymentCommand`. When Payment confirms the refund the saga sends `RestockInventoryCommand`; when Inventory confirms the units are back the order becomes `Cancelled` with its payment `Refunded` | `202 Accepted` `{ "status": "Cancelling", ... }`; poll `GET /api/orders/{id}` until `Cancelled` |
+| `Completing` (paid, the stock commit not confirmed yet) | The request is kept (in the saga's `FailureReason`). When the commit is confirmed the saga refunds instead of completing, then restocks as above. The order is never shown as `Confirmed` | `202 Accepted` |
+| `RefundingPayment` or `RestockingInventory` (already being cancelled) | Nothing new to do | `202 Accepted` |
+| The order has shipped or been delivered | Not cancellable: there is no shipping or return flow yet | `409 Conflict` `{ "message": "..." }` |
 
-The reason is stored on the saga and shown as the order's `failureReason` (`Cancelled by customer` / `Cancelled by admin`). If the release command is lost, the saga timeout service re-sends it (idempotent) up to 3 times before flagging the order for manual intervention.
+The reason is stored on the saga and shown as the order's `failureReason` (`Cancelled by customer` / `Cancelled by admin`). If the release command is lost, the saga timeout service re-sends it (idempotent) up to 3 times before flagging the order for manual intervention. A lost refund or restock is re-sent the same way but never given up on, because cancelling the order on a guess would leave the customer's money or the stock in between: after five tries each further attempt is logged as critical, and the oldest-active-order gauge and its alert show the order.
 
 ---
 
@@ -1147,7 +1159,7 @@ docker rm -f shopeasy-test-pg shopeasy-test-mq
 
 | Scenario | What it proves |
 |---|---|
-| A customer buys | An order whose request claims a price of one cent is priced by the catalog; it is accepted as `Pending`, the saga reserves the stock, takes the payment and the order becomes `Confirmed`; Inventory then holds fewer units by exactly the quantity ordered, Payment holds one charge for the total, the order is in the customer's list, and a confirmed order can no longer be cancelled (`409`). |
+| A customer buys | An order whose request claims a price of one cent is priced by the catalog; it is accepted as `Pending`, the saga reserves the stock, takes the payment and the order becomes `Confirmed`; Inventory then holds fewer units by exactly the quantity ordered, Payment holds one charge for the total, the order is in the customer's list, and cancelling the confirmed order refunds the payment, puts the units back and ends it `Cancelled` (covered by its own end-to-end scenario). |
 | The same request again | One `Idempotency-Key` placed twice gives the same order with `Idempotency-Replayed: true`, a different request under that key is refused (`422`), and one order and one unit off the shelf result. |
 | An order that cannot be filled | An unknown product and a quantity above the stock are each refused (`400`) with the reason; nothing is saved and the stock is unchanged. |
 | Who may see what | A visitor sees the catalog but not orders and cannot place one; a customer is known by the account they created; another customer is told the order does not exist (`404`) and may not read its payment (`403`); monitoring endpoints refuse a customer. |
@@ -1424,7 +1436,7 @@ ShopEasy/
 
 **`POST /api/orders` returns 400 "Product ... does not exist" / "no longer available"** — the `productId` is not in the Product catalog, or the product was deactivated. List valid ids with `GET /api/v1/products`.
 
-**`DELETE /api/orders/{id}` returns `409`** — the payment was already taken and the order is completing or completed; cancelling after that is not supported yet. **It returns `202`** — the cancellation was accepted and the saga is releasing stock; the order shows `Cancelled` shortly after (check `/sagas`, or the `inventory-release` queue if it takes longer than a couple of minutes).
+**`DELETE /api/orders/{id}` returns `409`** — the order has shipped or been delivered; there is no shipping or return flow yet. **It returns `202`** — the cancellation was accepted and the saga is releasing stock; the order shows `Cancelled` shortly after (check `/sagas`, or the `inventory-release` queue if it takes longer than a couple of minutes).
 
 **An order stays `Pending` and the saga sits in `Completing`** — payment succeeded and the saga is waiting for the Inventory service to confirm the stock commit. Check that the `inventory` container is up and that `inventory-commit` / `inventory-commit_error` in the RabbitMQ UI are empty. The timeout service re-sends the commit every ~2 minutes; the commit is idempotent, so this is safe.
 
@@ -1466,7 +1478,7 @@ This project is being hardened step by step. Status:
 
 **Known limitations today** (documented so nobody is surprised):
 
-- Orders cannot be cancelled once the payment is taken (`Completing` / `Completed`): there is no return, restock or partial-refund flow yet.
+- A shipped or delivered order cannot be cancelled, and there is no return or partial-refund flow yet. A paid order that is cancelled before it ships is refunded in full.
 - If the saga orchestrator itself fails three times on a saga it marks the saga `Failed` but does not update the order, which stays `Pending` until the customer cancels it (cancelling a `Failed` saga fixes the order).
 - The Order service's saga handlers still publish their commands *after* committing (they do not use the MassTransit outbox). A crash in that gap is recovered by the saga timeout service, which re-sends the command; every consumer is idempotent.
 - The Inventory consumers invalidate the Redis stock cache while MassTransit's transaction is still open (the commit follows immediately after the consumer returns). In that few-millisecond window a reader can re-cache the old stock level for up to its 30-second TTL. The cache is advisory — the saga's reservation is the authoritative check.
