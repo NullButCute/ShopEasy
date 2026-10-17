@@ -125,6 +125,7 @@ try
         x.AddConsumer<InventoryCommittedConsumer>();
         x.AddConsumer<InventoryCommitFailedConsumer>();
         x.AddConsumer<PaymentRefundedConsumer>();
+        x.AddConsumer<InventoryRestockedConsumer>();
 
         x.UsingRabbitMq((ctx, cfg) =>
         {
@@ -247,6 +248,18 @@ try
                     b.Durable = true;
                 });
                 e.ConfigureConsumer<PaymentRefundedConsumer>(ctx);
+            });
+
+            // Inventory reports that the stock of a cancelled, paid order is back
+            cfg.ReceiveEndpoint("order-saga-inventory-restocked", e =>
+            {
+                e.ConfigureConsumeTopology = false;
+                e.Bind("ShopEasy.Shared.Contracts:InventoryRestockedEvent", b =>
+                {
+                    b.ExchangeType = "fanout";
+                    b.Durable = true;
+                });
+                e.ConfigureConsumer<InventoryRestockedConsumer>(ctx);
             });
         });
     });

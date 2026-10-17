@@ -8,11 +8,13 @@ using ShopEasy.OrderService.Data;
 using ShopEasy.OrderService.ReadModels;
 using ShopEasy.OrderService.Sagas;
 using ShopEasy.Shared.Contracts;
+using ShopEasy.UnitTests.Support;
 using Xunit;
 
 namespace ShopEasy.UnitTests.Sagas;
 
 // The steps of cancelling an order that was already paid, as the saga takes them.
+[Collection(MetricsCollection.Name)]
 public class PaidCancellationTests : IDisposable
 {
     private readonly OrderDbContext _db = new(new DbContextOptionsBuilder<OrderDbContext>()
@@ -79,6 +81,49 @@ public class PaidCancellationTests : IDisposable
         (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).Status.Should().Be(status);
         (await _db.OrderSummaries.SingleAsync(s => s.OrderId == orderId)).PaymentStatus.Should().Be("Succeeded");
         await _publish.DidNotReceive().Publish(Arg.Any<RestockInventoryCommand>(), Arg.Any<CancellationToken>());
+    }
+
+    private async Task StockRestored(Guid orderId)
+    {
+        var context = Substitute.For<ConsumeContext<InventoryRestockedEvent>>();
+        context.Message.Returns(new InventoryRestockedEvent { OrderId = orderId });
+        await new InventoryRestockedConsumer(_db, new InMemorySagaLocking(),
+            new OrderReadModelUpdater(_db, NullLogger<OrderReadModelUpdater>.Instance),
+            NullLogger<InventoryRestockedConsumer>.Instance).Consume(context);
+    }
+
+    private static Task<double> CancelledByCustomer() =>
+        MetricValues.ReadAsync("shopeasy_order_outcomes_total{outcome=\"cancelled\",reason=\"customer\"}");
+
+    [Fact]
+    public async Task WhenTheStockIsBack_TheOrderIsCancelled_AndRefunded_AndCountedOnce()
+    {
+        var orderId = await Seed(SagaStatus.RestockingInventory);
+        var before = await CancelledByCustomer();
+
+        await StockRestored(orderId);
+        await StockRestored(orderId); // a repeat of the event
+
+        (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).Status.Should().Be(SagaStatus.Cancelled);
+        (await _db.Orders.SingleAsync(o => o.Id == orderId)).Status.Should().Be(OrderStatus.Cancelled);
+        var summary = await _db.OrderSummaries.SingleAsync(s => s.OrderId == orderId);
+        (summary.StatusName, summary.PaymentStatus, summary.FailureReason).Should().Be(("Cancelled", "Refunded", "Cancelled by customer"));
+        (await CancelledByCustomer()).Should().Be(before + 1);
+    }
+
+    [Theory]
+    [InlineData(SagaStatus.Completed)]
+    [InlineData(SagaStatus.RefundingPayment)] // the stock cannot be back before the money is
+    [InlineData(SagaStatus.ReleasingInventory)]
+    [InlineData(SagaStatus.Cancelled)]
+    public async Task StockThatTheSagaWasNotWaitingFor_ChangesNothing(SagaStatus status)
+    {
+        var orderId = await Seed(status);
+
+        await StockRestored(orderId);
+
+        (await _db.SagaStates.SingleAsync(s => s.OrderId == orderId)).Status.Should().Be(status);
+        (await _db.Orders.SingleAsync(o => o.Id == orderId)).Status.Should().Be(OrderStatus.Confirmed);
     }
 
     [Fact]
