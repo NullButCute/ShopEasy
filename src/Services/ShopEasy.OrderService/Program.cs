@@ -124,6 +124,7 @@ try
         x.AddConsumer<InventoryReleasedConsumer>();
         x.AddConsumer<InventoryCommittedConsumer>();
         x.AddConsumer<InventoryCommitFailedConsumer>();
+        x.AddConsumer<PaymentRefundedConsumer>();
 
         x.UsingRabbitMq((ctx, cfg) =>
         {
@@ -234,6 +235,18 @@ try
                     b.Durable = true;
                 });
                 e.ConfigureConsumer<InventoryCommitFailedConsumer>(ctx);
+            });
+
+            // Payment reports that a refund is done (the cancellation of a paid order)
+            cfg.ReceiveEndpoint("order-saga-payment-refunded", e =>
+            {
+                e.ConfigureConsumeTopology = false;
+                e.Bind("ShopEasy.Shared.Contracts:PaymentRefundedEvent", b =>
+                {
+                    b.ExchangeType = "fanout";
+                    b.Durable = true;
+                });
+                e.ConfigureConsumer<PaymentRefundedConsumer>(ctx);
             });
         });
     });

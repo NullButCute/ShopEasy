@@ -14,7 +14,10 @@ public enum SagaStatus
     Completed,
     ReleasingInventory,
     Cancelled,
-    Failed
+    Failed,
+    // Cancelling an order that was already paid: the refund is out, then the stock is put back
+    RefundingPayment,
+    RestockingInventory
 }
 
 public class OrderSagaState
