@@ -52,10 +52,35 @@ public class OrderJourneyTests(ShopFixture shop)
         list.Status.Should().Be(HttpStatusCode.OK, "{0}", list);
         list.Json.Prop("items").EnumerateArray()
             .Should().Contain(o => o.Text("orderId") == orderId && o.Text("statusName") == "Confirmed");
+    }
 
-        // an order whose payment is taken cannot be cancelled any more
+    [Fact]
+    public async Task AConfirmedOrder_CanBeCancelled_TheMoneyIsRefunded_AndTheStockIsBack()
+    {
+        var before = await Catalog.StockAsync(Customer, Catalog.Keyboard);
+        var placed = await Customer.PostAsync("/api/orders",
+            new { items = new[] { new { productId = Catalog.Keyboard, quantity = 2 } } }, Guid.NewGuid().ToString());
+        placed.Status.Should().Be(HttpStatusCode.Created, "{0}", placed);
+        var orderId = placed.Json.Text("id");
+        await WaitForStatusAsync(orderId, "Confirmed");
+        await Wait.UntilAsync(() => Catalog.StockAsync(Customer, Catalog.Keyboard),
+            stock => stock.Quantity == before.Quantity - 2, "the units to leave the shelf", TimeSpan.FromSeconds(45));
+
+        // the payment is taken and the order is complete, and it is still cancellable: the money
+        // goes back, then the stock, and only then is the order Cancelled
         var cancel = await Customer.DeleteAsync($"/api/orders/{orderId}");
-        cancel.Status.Should().Be(HttpStatusCode.Conflict, "{0}", cancel);
+        cancel.Status.Should().Be(HttpStatusCode.Accepted, "{0}", cancel);
+
+        var cancelled = await WaitForStatusAsync(orderId, "Cancelled");
+        cancelled.Json.Text("paymentStatus").Should().Be("Refunded");
+        var after = await Wait.UntilAsync(() => Catalog.StockAsync(Customer, Catalog.Keyboard),
+            stock => stock.Quantity == before.Quantity, "the stock to be put back", TimeSpan.FromSeconds(45));
+        after.Should().Be(before);
+
+        // asking again changes nothing and says so
+        var again = await Customer.DeleteAsync($"/api/orders/{orderId}");
+        again.Status.Should().Be(HttpStatusCode.NoContent, "{0}", again);
+        (await Catalog.StockAsync(Customer, Catalog.Keyboard)).Should().Be(before);
     }
 
     [Fact]

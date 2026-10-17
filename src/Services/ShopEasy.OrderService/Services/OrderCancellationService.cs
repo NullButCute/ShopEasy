@@ -15,7 +15,7 @@ public enum CancelOutcome
     Cancelling,         // accepted: the saga is releasing stock / the payment will be refunded
     AlreadyCancelled,   // nothing to do — repeating a cancel is safe
     NotFound,           // no such order (or it belongs to someone else)
-    NotCancellable      // payment was taken and the order is being/has been completed
+    NotCancellable      // too late: the order has shipped, or its payment is being finalized
 }
 
 public record CancelResult(CancelOutcome Outcome, string? Message = null);
@@ -33,7 +33,11 @@ public record CancelResult(CancelOutcome Outcome, string? Message = null);
 //                                           succeeds is refunded by the late-payment guard    → Cancelling
 //   ReleasingInventory                    → compensation already running                      → Cancelling
 //   Cancelled / Failed                    → already over                                      → AlreadyCancelled
-//   Completing / Completed                → payment taken: too late to cancel                 → NotCancellable
+//   Completed (paid, committed)           → saga moves to RefundingPayment and a RefundPaymentCommand
+//                                           is sent; the refund, then the restock, then Cancelled → Cancelling
+//   RefundingPayment / RestockingInventory→ that cancellation is already running                → Cancelling
+//   Completing                            → payment taken, commit in flight: too late for now   → NotCancellable
+//   a shipped or delivered order          → NotCancellable
 public class OrderCancellationService(
     OrderDbContext db,
     ISagaLocking sagaLocking,
@@ -50,11 +54,11 @@ public class OrderCancellationService(
         {
             try
             {
-                var (result, releaseInventory) =
+                var (result, command) =
                     await TryCancelAsync(orderId, requesterId, isAdmin, ct);
 
-                if (releaseInventory)
-                    await PublishReleaseAsync(orderId, ct);
+                if (command is not null)
+                    await PublishFollowUpAsync(command, ct);
 
                 return result;
             }
@@ -70,7 +74,8 @@ public class OrderCancellationService(
         }
     }
 
-    private async Task<(CancelResult Result, bool ReleaseInventory)> TryCancelAsync(
+    // The result, and the command that carries the cancellation on (a release or a refund), if any
+    private async Task<(CancelResult Result, object? Command)> TryCancelAsync(
         Guid orderId, string requesterId, bool isAdmin, CancellationToken ct)
     {
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
@@ -82,16 +87,16 @@ public class OrderCancellationService(
 
         // Other customers' orders look like they do not exist
         if (order is null || (!isAdmin && order.UserId != requesterId))
-            return (new CancelResult(CancelOutcome.NotFound), false);
+            return (new CancelResult(CancelOutcome.NotFound), null);
 
         var reason = order.UserId == requesterId ? FailureReasons.CancelledByCustomer : FailureReasons.CancelledByAdmin;
         var now = DateTime.UtcNow;
 
         if (order.Status == OrderStatus.Cancelled)
-            return (new CancelResult(CancelOutcome.AlreadyCancelled), false);
+            return (new CancelResult(CancelOutcome.AlreadyCancelled), null);
 
-        if (order.Status is OrderStatus.Confirmed or OrderStatus.Shipped or OrderStatus.Delivered)
-            return (NotCancellable("The order is already confirmed and can no longer be cancelled."), false);
+        if (order.Status is OrderStatus.Shipped or OrderStatus.Delivered)
+            return (NotCancellable("The order has already shipped and can no longer be cancelled."), null);
 
         // ── The saga has not been created yet (the outbox event is still in flight) ──
         if (saga is null)
@@ -124,29 +129,46 @@ public class OrderCancellationService(
             OrderMetrics.RecordOrderCancelled(FailureReasons.CancelReasonOf(reason));
             logger.LogInformation(
                 "Order {OrderId} cancelled before its saga started ({Reason})", orderId, reason);
-            return (new CancelResult(CancelOutcome.Cancelled), false);
+            return (new CancelResult(CancelOutcome.Cancelled), null);
         }
 
         switch (saga.Status)
         {
             case SagaStatus.Completed:
-                return (NotCancellable("The order has already been completed and can no longer be cancelled."), false);
+                // Paid and committed: give the money back, then the stock (PaymentRefundedConsumer
+                // and InventoryRestockedConsumer take the next steps); the order is Cancelled at the end
+                saga.Status = SagaStatus.RefundingPayment;
+                saga.FailureReason = reason;
+                saga.UpdatedAt = now;
+                await db.SaveChangesAsync(ct);
+
+                await readModelUpdater.UpdateStatusAsync(
+                    order.Id, order.Status, paymentStatus: "Refunding", failureReason: reason);
+                await transaction.CommitAsync(ct);
+
+                logger.LogInformation(
+                    "Order {OrderId} cancellation accepted after payment — refunding ({Reason})", orderId, reason);
+                return (new CancelResult(CancelOutcome.Cancelling,
+                    "Cancellation accepted. The payment is being refunded and the stock put back."),
+                    new RefundPaymentCommand { OrderId = order.Id, Reason = reason });
 
             case SagaStatus.Completing:
                 return (NotCancellable(
                     "Payment was already taken and the order is being finalized; " +
-                    "it can no longer be cancelled."), false);
+                    "it can no longer be cancelled."), null);
 
             case SagaStatus.Cancelled:
             case SagaStatus.Failed:
                 // The saga is already over; make sure the order says so, then report success
                 await MarkCancelledAsync(order, saga.FailureReason ?? reason, now, ct);
                 await transaction.CommitAsync(ct);
-                return (new CancelResult(CancelOutcome.AlreadyCancelled), false);
+                return (new CancelResult(CancelOutcome.AlreadyCancelled), null);
 
             case SagaStatus.ReleasingInventory:
+            case SagaStatus.RefundingPayment:
+            case SagaStatus.RestockingInventory:
                 return (new CancelResult(CancelOutcome.Cancelling,
-                    "The order is already being cancelled."), false);
+                    "The order is already being cancelled."), null);
 
             case SagaStatus.Started:
                 // Nothing has been reserved or charged yet: cancel on the spot
@@ -160,7 +182,7 @@ public class OrderCancellationService(
                 OrderMetrics.RecordOrderCancelled(FailureReasons.CancelReasonOf(reason));
                 logger.LogInformation(
                     "Order {OrderId} cancelled before any stock was reserved ({Reason})", orderId, reason);
-                return (new CancelResult(CancelOutcome.Cancelled), false);
+                return (new CancelResult(CancelOutcome.Cancelled), null);
 
             case SagaStatus.ReservingInventory:
             case SagaStatus.ProcessingPayment:
@@ -183,10 +205,10 @@ public class OrderCancellationService(
                     orderId, previousStatus, reason);
                 return (new CancelResult(CancelOutcome.Cancelling,
                     "Cancellation accepted. Reserved stock is being released and any payment will be refunded."),
-                    true);
+                    new ReleaseInventoryCommand { OrderId = order.Id });
 
             default:
-                return (NotCancellable($"The order cannot be cancelled in its current state ({saga.Status})."), false);
+                return (NotCancellable($"The order cannot be cancelled in its current state ({saga.Status})."), null);
         }
     }
 
@@ -201,19 +223,22 @@ public class OrderCancellationService(
             order.Id, OrderStatus.Cancelled, failureReason: reason);
     }
 
-    private async Task PublishReleaseAsync(Guid orderId, CancellationToken ct)
+    private async Task PublishFollowUpAsync(object command, CancellationToken ct)
     {
         try
         {
-            await publishEndpoint.Publish(new ReleaseInventoryCommand { OrderId = orderId }, ct);
+            switch (command)
+            {
+                case ReleaseInventoryCommand release: await publishEndpoint.Publish(release, ct); break;
+                case RefundPaymentCommand refund: await publishEndpoint.Publish(refund, ct); break;
+            }
         }
         catch (Exception ex)
         {
             // The cancellation is already saved. If the command was lost, SagaTimeoutService
-            // re-sends it (release is idempotent), so the caller still gets "accepted".
+            // re-sends it (release and refund are idempotent), so the caller still gets "accepted".
             logger.LogError(ex,
-                "Could not publish ReleaseInventoryCommand for Order {OrderId}; " +
-                "the saga timeout service will retry", orderId);
+                "Could not publish {Command}; the saga timeout service will retry", command.GetType().Name);
         }
     }
 

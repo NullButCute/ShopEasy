@@ -188,8 +188,9 @@ public class CancellationTests : IDisposable
 
     [Theory]
     [InlineData(SagaStatus.Completing, OrderStatus.Pending)]
-    [InlineData(SagaStatus.Completed, OrderStatus.Confirmed)]
-    public async Task OncePaymentIsTaken_TheOrderCanNoLongerBeCancelled(SagaStatus saga, OrderStatus order)
+    [InlineData(SagaStatus.Completed, OrderStatus.Shipped)]
+    [InlineData(SagaStatus.Completed, OrderStatus.Delivered)]
+    public async Task WhileThePaymentIsBeingFinalized_OrAfterShipping_TheOrderCanNoLongerBeCancelled(SagaStatus saga, OrderStatus order)
     {
         var orderId = await Seed(saga, order);
 
@@ -199,6 +200,40 @@ public class CancellationTests : IDisposable
         result.Message.Should().NotBeNullOrEmpty();
         (await SagaOf(orderId)).Status.Should().Be(saga);
         (await OrderOf(orderId)).Status.Should().Be(order);
+        await AssertNothingPublished();
+    }
+
+    [Theory]
+    [InlineData(false, "Cancelled by customer")]
+    [InlineData(true, "Cancelled by admin")]
+    public async Task AConfirmedOrder_IsCancelledByRefundingTheMoneyFirst(bool admin, string reason)
+    {
+        var orderId = await Seed(SagaStatus.Completed, OrderStatus.Confirmed);
+
+        var result = await _service.CancelAsync(orderId, admin ? "an-admin" : Owner, isAdmin: admin);
+
+        result.Outcome.Should().Be(CancelOutcome.Cancelling);
+        var saga = await SagaOf(orderId);
+        (saga.Status, saga.FailureReason).Should().Be((SagaStatus.RefundingPayment, reason));
+        (await OrderOf(orderId)).Status.Should().Be(OrderStatus.Confirmed, "it is only Cancelled once the money and the stock are back");
+        var summary = await SummaryOf(orderId);
+        (summary.PaymentStatus, summary.FailureReason).Should().Be(("Refunding", reason));
+        await _publish.Received(1).Publish(
+            Arg.Is<RefundPaymentCommand>(c => c.OrderId == orderId && c.Reason == reason), Arg.Any<CancellationToken>());
+        await _publish.DidNotReceive().Publish(Arg.Any<ReleaseInventoryCommand>(), Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(SagaStatus.RefundingPayment)]
+    [InlineData(SagaStatus.RestockingInventory)]
+    public async Task CancellingAPaidOrderThatIsAlreadyBeingCancelled_ReportsInProgress_WithoutAnotherCommand(SagaStatus status)
+    {
+        var orderId = await Seed(status, OrderStatus.Confirmed);
+
+        var result = await _service.CancelAsync(orderId, Owner, isAdmin: false);
+
+        result.Outcome.Should().Be(CancelOutcome.Cancelling);
+        (await SagaOf(orderId)).Status.Should().Be(status);
         await AssertNothingPublished();
     }
 

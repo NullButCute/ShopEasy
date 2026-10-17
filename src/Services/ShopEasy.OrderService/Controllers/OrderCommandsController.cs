@@ -333,8 +333,8 @@ public class OrderCommandsController(
 
     // ── DELETE /api/orders/{id} ───────────────────────────────────────────────
     // Cancels the order through the saga (see OrderCancellationService):
-    //   204 cancelled / already cancelled · 202 accepted, stock release + refund in progress
-    //   404 unknown order (or someone else's) · 409 too late: payment taken, order completing/completed
+    //   204 cancelled / already cancelled · 202 accepted, stock release and/or refund in progress
+    //   404 unknown order (or someone else's) · 409 too late: shipped, or the payment is being finalized
     [HttpDelete("{id:guid}")]
     public async Task<IActionResult> Cancel(Guid id)
     {
