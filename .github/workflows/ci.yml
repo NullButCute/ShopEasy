@@ -126,13 +126,44 @@ jobs:
       - name: Build
         run: dotnet build ShopEasy.sln --configuration Release --no-restore
 
+      # The test host has stalled on CI before (every thread idle, no test finishing) and is
+      # only aborted after 5 minutes of silence, which says nothing about why. A healthy run takes
+      # about two minutes, so a test host still alive after 200 s is stuck or very slow: record
+      # where every thread is, twice, for the step after this one to print.
       - name: Test
-        run: >-
-          dotnet test src/Tests/ShopEasy.UnitTests
-          --configuration Release --no-build
-          --blame-hang-timeout 5m --blame-hang-dump-type none
-          --logger "trx;LogFileName=unit-tests.trx"
-          --results-directory TestResults
+        run: |
+          mkdir -p TestResults
+          dotnet tool install dotnet-stack --version 10.0.750501 --tool-path "$RUNNER_TEMP/tools" \
+            || echo "::warning::dotnet-stack could not be installed; a stalled run will not show its stacks"
+          (
+            sleep 200
+            for _ in 1 2; do
+              for pid in $(pgrep -f testhost.dll); do "$RUNNER_TEMP/tools/dotnet-stack" report -p "$pid" || true; done
+              echo "---- $(date -u +%T) ----"
+              sleep 60
+            done
+          ) > TestResults/stall-stacks.txt 2>&1 &
+          watcher=$!
+          status=0
+          dotnet test src/Tests/ShopEasy.UnitTests \
+            --configuration Release --no-build \
+            --blame-hang-timeout 5m --blame-hang-dump-type none \
+            --logger "trx;LogFileName=unit-tests.trx" \
+            --results-directory TestResults || status=$?
+          kill "$watcher" 2>/dev/null || true
+          exit $status
+
+      # Which tests had started and not finished (written when blame aborts the run), and the
+      # thread stacks recorded above. Nothing is printed when the run was not stalled.
+      - name: Show where a stalled run was stuck
+        if: failure()
+        run: |
+          for f in TestResults/*/Sequence_*.xml TestResults/stall-stacks.txt; do
+            test -s "$f" || continue
+            echo "::group::$f"
+            grep -v 'Completed="True"' "$f"
+            echo "::endgroup::"
+          done
 
       # The PostgreSQL/RabbitMQ tests skip themselves when their server is not configured.
       # That is right on a laptop but must never happen here: a mis-wired service container
